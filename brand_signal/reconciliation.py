@@ -5,6 +5,7 @@ from collections import defaultdict
 from .analytics import Analytics, days_between
 from .catalog import market_day
 from .errors import require
+from .lifecycle import DeviceLifecycle
 from .store import Store, now
 
 
@@ -12,6 +13,7 @@ class Reconciliation:
     def __init__(self, store: Store):
         self.store = store
         self.analytics = Analytics(store)
+        self.lifecycle = DeviceLifecycle(store)
 
     def inspect(self, market: str, from_day: str, to_day: str) -> dict:
         with self.store.read() as db:
@@ -48,6 +50,16 @@ class Reconciliation:
                     issues.append({"kind": "market_meter_gap", "product": row["product"], "day": row["day"], "active_devices": row["active_devices"]})
                 if row["ticket_open_at_end"] > row["active_devices"]:
                     issues.append({"kind": "case_load_exceeds_fleet", "product": row["product"], "day": row["day"], "open_cases": row["ticket_open_at_end"]})
+            # 生命周期修订造成的事件排除不属于数据缺陷，但要逐条可见，避免“静默消失”。
+            for item in self.lifecycle.exclusions(market, from_day, to_day)["exclusions"]:
+                issues.append({
+                    "kind": "event_outside_lifecycle",
+                    "device": item["device_id"],
+                    "day": item["day"],
+                    "source": item["source"],
+                    "event": item["event_id"],
+                    "reason": item["reason"],
+                })
             issues.sort(key=lambda item: (item["day"], item["kind"], item.get("device", "")))
             return {"market": market, "from_day": from_day, "to_day": to_day, "source_revision": self.store.revision(db), "issues": issues, "issue_count": len(issues)}
 

@@ -21,6 +21,7 @@ from .reviews import Reviews
 from .comparison import Comparison
 from .investigations import Investigations
 from .lineage import Lineage
+from .lifecycle import DeviceLifecycle
 from .rollups import Rollups
 from .sampling import Sampling
 from .mappings import Mappings
@@ -46,6 +47,19 @@ class DeviceIn(BaseModel):
 class RetireIn(BaseModel):
     retired_at: str
     expected_revision: int
+
+
+class LifecycleIn(BaseModel):
+    installed_at: str
+    expected_revision: int
+    note: str = ""
+
+
+class LifecycleImpactIn(BaseModel):
+    installed_at: str
+    expected_revision: int | None = None
+    from_day: str | None = None
+    to_day: str | None = None
 
 
 class BatchIn(BaseModel):
@@ -160,6 +174,7 @@ def create_app(path: str | None = None) -> FastAPI:
     comparison = Comparison(db)
     investigations = Investigations(db)
     lineage = Lineage(db)
+    lifecycle = DeviceLifecycle(db)
     rollups = Rollups(db)
     sampling = Sampling(db)
     mappings = Mappings(db)
@@ -193,6 +208,26 @@ def create_app(path: str | None = None) -> FastAPI:
     @app.post("/devices/{device_id}/retire")
     def retire(device_id: str, body: RetireIn):
         return catalog.retire(device_id, body.retired_at, body.expected_revision)
+
+    @app.post("/devices/{device_id}/lifecycle/impact")
+    def lifecycle_impact(device_id: str, body: LifecycleImpactIn):
+        return lifecycle.impact(device_id, body.installed_at, body.from_day, body.to_day, expected_revision=body.expected_revision)
+
+    @app.post("/devices/{device_id}/lifecycle")
+    def revise_lifecycle(device_id: str, body: LifecycleIn):
+        return lifecycle.revise(device_id, body.installed_at, body.expected_revision, body.note)
+
+    @app.get("/devices/{device_id}/lifecycle")
+    def lifecycle_history(device_id: str):
+        return lifecycle.history(device_id)
+
+    @app.get("/devices/{device_id}/lifecycle/dispositions")
+    def lifecycle_dispositions(device_id: str, revision: int | None = None):
+        return lifecycle.dispositions(device_id, revision)
+
+    @app.get("/lifecycle/exclusions/{market}")
+    def lifecycle_exclusions(market: str, from_day: str, to_day: str, product: str | None = None, source_revision: int | None = None):
+        return lifecycle.exclusions(market, from_day, to_day, product, source_revision)
 
     @app.post("/ingest/{source}/preview")
     def preview(source: str, body: BatchIn):

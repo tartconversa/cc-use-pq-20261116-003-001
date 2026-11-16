@@ -6,7 +6,7 @@ from .publication import Publication
 from .store import Store
 
 
-SUM_FIELDS = ("installed_devices", "active_devices", "exposure_hours", "ticket_opened", "ticket_closed", "ticket_open_at_end", "critical_opened", "acknowledged", "response_hours_total", "telemetry_events", "devices_reporting", "run_hours", "downtime_hours")
+SUM_FIELDS = ("installed_devices", "active_devices", "exposure_hours", "ticket_opened", "ticket_closed", "ticket_open_at_end", "critical_opened", "acknowledged", "response_hours_total", "telemetry_events", "devices_reporting", "run_hours", "downtime_hours", "excluded_tickets", "excluded_telemetry", "excluded_ticket_actions")
 
 
 class Rollups:
@@ -21,7 +21,7 @@ class Rollups:
         for row in release["rows"]:
             totals = by_day[row["day"]]
             for key in SUM_FIELDS:
-                totals[key] += row[key]
+                totals[key] += row.get(key, 0)
             product_count[row["day"]] += 1
         items = []
         for day in sorted(by_day):
@@ -34,7 +34,9 @@ class Rollups:
             require(existing in (0, len(items)), "partial_rollup", "materialization is incomplete", 409)
             if existing:
                 stored = [json.loads(r[0]) for r in db.execute("SELECT payload FROM market_rollups WHERE market=? AND version=? ORDER BY day", (market, version))]
-                require(stored == items, "rollup_conflict", "materialized totals disagree with release", 409)
+                # 旧库中已物化的汇总没有排除计数字段；补零后再比较，避免误报冲突。
+                normalized = [{**{key: 0 for key in SUM_FIELDS if key not in item}, **item} for item in stored]
+                require(normalized == items, "rollup_conflict", "materialized totals disagree with release", 409)
                 return {"market": market, "version": version, "days": len(items), "replay": True}
             for item in items:
                 db.execute("INSERT INTO market_rollups VALUES(?,?,?,?)", (market, version, item["day"], json.dumps(item, sort_keys=True)))

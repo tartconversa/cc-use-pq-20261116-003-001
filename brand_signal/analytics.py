@@ -3,6 +3,7 @@ from collections import defaultdict
 from datetime import date, timedelta
 from .catalog import Catalog, instant, market_day
 from .errors import DomainError, require
+from .lifecycle import outside_reason
 from .store import Store
 
 
@@ -28,28 +29,31 @@ class Analytics:
     def __init__(self, store: Store):
         self.store = store
 
-    def calculate(self, db, market: str, from_day: str, to_day: str) -> list[dict]:
+    def calculate(self, db, market: str, from_day: str, to_day: str, overrides: dict[str, dict] | None = None, only: set[str] | None = None) -> list[dict]:
         zone_row = db.execute("SELECT timezone FROM markets WHERE code=?", (market,)).fetchone()
         require(zone_row is not None, "unknown_market", "market unknown", 404)
         zone = zone_row["timezone"]
         days = list(days_between(from_day, to_day))
-        devices = db.execute("SELECT * FROM devices WHERE market=? ORDER BY id", (market,)).fetchall()
+        devices = [dict(row) for row in db.execute("SELECT * FROM devices WHERE market=? ORDER BY id", (market,))]
+        if only is not None:
+            devices = [device for device in devices if device["id"] in only]
+        for device in devices:
+            device.update((overrides or {}).get(device["id"], {}))
         products = [row["code"] for row in db.execute("SELECT code FROM products ORDER BY code")]
-        tickets = db.execute("SELECT t.* FROM tickets t JOIN devices d ON d.id=t.device_id WHERE d.market=? ORDER BY t.id", (market,)).fetchall()
-        history = db.execute("SELECT h.* FROM ticket_history h JOIN tickets t ON t.id=h.ticket_id JOIN devices d ON d.id=t.device_id WHERE d.market=? ORDER BY h.ticket_id,h.revision", (market,)).fetchall()
-        telemetry = db.execute("SELECT e.* FROM telemetry e JOIN devices d ON d.id=e.device_id WHERE d.market=? ORDER BY e.id", (market,)).fetchall()
+        device_ids = {device["id"] for device in devices}
+        tickets = [row for row in db.execute("SELECT t.* FROM tickets t JOIN devices d ON d.id=t.device_id WHERE d.market=? ORDER BY t.id", (market,)) if row["device_id"] in device_ids]
+        ticket_ids = {ticket["id"] for ticket in tickets}
+        history = [row for row in db.execute("SELECT h.* FROM ticket_history h JOIN tickets t ON t.id=h.ticket_id JOIN devices d ON d.id=t.device_id WHERE d.market=? ORDER BY h.ticket_id,h.revision", (market,)) if row["ticket_id"] in ticket_ids]
+        telemetry = [row for row in db.execute("SELECT e.* FROM telemetry e JOIN devices d ON d.id=e.device_id WHERE d.market=? ORDER BY e.id", (market,)) if row["device_id"] in device_ids]
         group = {}
         for day in days:
             for product in products:
-                group[(day, product)] = {"day": day, "market": market, "product": product, "installed_devices": 0, "active_devices": 0, "exposure_hours": 0.0, "ticket_opened": 0, "ticket_closed": 0, "ticket_open_at_end": 0, "critical_opened": 0, "acknowledged": 0, "response_hours_total": 0.0, "telemetry_events": 0, "devices_reporting": 0, "run_hours": 0.0, "downtime_hours": 0.0, "telemetry_coverage": None, "tickets_per_100_devices": None, "downtime_share": None}
+                group[(day, product)] = {"day": day, "market": market, "product": product, "installed_devices": 0, "active_devices": 0, "exposure_hours": 0.0, "ticket_opened": 0, "ticket_closed": 0, "ticket_open_at_end": 0, "critical_opened": 0, "acknowledged": 0, "response_hours_total": 0.0, "telemetry_events": 0, "devices_reporting": 0, "run_hours": 0.0, "downtime_hours": 0.0, "excluded_tickets": 0, "excluded_telemetry": 0, "excluded_ticket_actions": 0, "telemetry_coverage": None, "tickets_per_100_devices": None, "downtime_share": None}
         device_map = {r["id"]: r for r in devices}
         reported = defaultdict(set)
-        opened = defaultdict(list)
         transitions = defaultdict(list)
         for item in history:
             transitions[item["ticket_id"]].append(item)
-        for item in tickets:
-            opened[item["device_id"]].append(item)
         for day in days:
             day_start, day_end = Catalog.local_bounds(day, zone)
             for device in devices:
@@ -67,13 +71,25 @@ class Analytics:
             for ticket in tickets:
                 device = device_map[ticket["device_id"]]
                 result = group[(day, device["product"])]
-                if market_day(ticket["opened_at"], zone) == day:
+                outside = outside_reason(instant(device["installed_at"]), instant(device["retired_at"]) if device["retired_at"] else None, instant(ticket["opened_at"]))
+                opened_day = market_day(ticket["opened_at"], zone)
+                if outside is None and opened_day == day:
                     result["ticket_opened"] += 1
                     if ticket["severity"] == "critical":
                         result["critical_opened"] += 1
+                elif outside is not None and opened_day == day:
+                    result["excluded_tickets"] += 1
                 actions = transitions[ticket["id"]]
                 for action in actions:
-                    if market_day(action["event_at"], zone) != day:
+                    if action["action"] == "open":
+                        # 开单动作已由 ticket_opened/excluded_tickets 表示，不重复计为处置。
+                        continue
+                    action_day = market_day(action["event_at"], zone)
+                    if action_day != day:
+                        continue
+                    action_outside = outside_reason(instant(device["installed_at"]), instant(device["retired_at"]) if device["retired_at"] else None, instant(action["event_at"]))
+                    if outside is not None or action_outside is not None:
+                        result["excluded_ticket_actions"] += 1
                         continue
                     if action["action"] == "close":
                         result["ticket_closed"] += 1
@@ -84,12 +100,16 @@ class Analytics:
                 for action in actions:
                     if instant(action["event_at"]) < day_end:
                         latest = action["state"]
-                if instant(ticket["opened_at"]) < day_end and latest not in {"closed", "cancelled"}:
+                if outside is None and instant(ticket["opened_at"]) < day_end and latest not in {"closed", "cancelled"}:
                     result["ticket_open_at_end"] += 1
             for event in telemetry:
                 if market_day(event["observed_at"], zone) == day:
                     device = device_map[event["device_id"]]
                     result = group[(day, device["product"])]
+                    outside = outside_reason(instant(device["installed_at"]), instant(device["retired_at"]) if device["retired_at"] else None, instant(event["observed_at"]))
+                    if outside is not None:
+                        result["excluded_telemetry"] += 1
+                        continue
                     result["telemetry_events"] += 1
                     result["run_hours"] += event["run_hours"]
                     result["downtime_hours"] += event["downtime_hours"]

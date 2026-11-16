@@ -17,7 +17,12 @@ class Alerts:
         require(report["source_revision"] == expected_source_revision, "stale_source", "source revision changed", 409)
         alerts = []
         for issue in report["issues"]:
-            severity = "high" if issue["kind"] in {"ticket_without_meter", "case_load_exceeds_fleet"} else "medium"
+            if issue["kind"] in {"ticket_without_meter", "case_load_exceeds_fleet"}:
+                severity = "high"
+            elif issue["kind"] == "event_outside_lifecycle":
+                severity = "low"
+            else:
+                severity = "medium"
             alerts.append({"source": "reconciliation", "day": issue["day"], "kind": issue["kind"], "severity": severity, "payload": issue})
         with self.store.transaction() as db:
             require(self.store.revision(db) == expected_source_revision, "stale_source", "source revision changed", 409)

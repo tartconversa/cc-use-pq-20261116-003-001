@@ -1,4 +1,5 @@
 """跨市场设备服务质量分析：store模块。"""
+import hashlib
 import json
 import sqlite3
 from contextlib import contextmanager
@@ -10,6 +11,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS markets(code TEXT PRIMARY KEY, timezone TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS products(code TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS devices(id TEXT PRIMARY KEY, market TEXT NOT NULL REFERENCES markets(code), product TEXT NOT NULL REFERENCES products(code), installed_at TEXT NOT NULL, retired_at TEXT, revision INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE IF NOT EXISTS device_revisions(device_id TEXT NOT NULL REFERENCES devices(id), revision INTEGER NOT NULL, action TEXT NOT NULL, installed_at TEXT NOT NULL, retired_at TEXT, previous_installed_at TEXT, previous_retired_at TEXT, note TEXT NOT NULL DEFAULT '', source_revision INTEGER NOT NULL, at TEXT NOT NULL, PRIMARY KEY(device_id,revision));
+CREATE TABLE IF NOT EXISTS lifecycle_dispositions(source TEXT NOT NULL, event_id TEXT NOT NULL, device_id TEXT NOT NULL REFERENCES devices(id), device_revision INTEGER NOT NULL, source_revision INTEGER NOT NULL, event_at TEXT NOT NULL, disposition TEXT NOT NULL, reason TEXT NOT NULL, installed_at TEXT NOT NULL, retired_at TEXT, at TEXT NOT NULL, PRIMARY KEY(source,event_id,device_revision));
 CREATE TABLE IF NOT EXISTS batches(id TEXT PRIMARY KEY, source TEXT NOT NULL, request_key TEXT NOT NULL, digest TEXT NOT NULL, status TEXT NOT NULL, accepted INTEGER NOT NULL DEFAULT 0, rejected INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, UNIQUE(source, request_key));
 CREATE TABLE IF NOT EXISTS batch_rows(batch_id TEXT NOT NULL REFERENCES batches(id), row_no INTEGER NOT NULL, event_key TEXT, status TEXT NOT NULL, reason TEXT, payload TEXT NOT NULL, PRIMARY KEY(batch_id,row_no));
 CREATE TABLE IF NOT EXISTS source_events(source TEXT NOT NULL, event_key TEXT NOT NULL, digest TEXT NOT NULL, record_id TEXT NOT NULL, PRIMARY KEY(source,event_key));
@@ -21,7 +24,7 @@ INSERT OR IGNORE INTO revisions(id,value) VALUES(1,0);
 CREATE TABLE IF NOT EXISTS candidates(id TEXT PRIMARY KEY, market TEXT NOT NULL, from_day TEXT NOT NULL, to_day TEXT NOT NULL, source_revision INTEGER NOT NULL, expected_head INTEGER NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS candidate_rows(candidate_id TEXT NOT NULL REFERENCES candidates(id), day TEXT NOT NULL, product TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(candidate_id,day,product));
 CREATE TABLE IF NOT EXISTS publication_heads(market TEXT PRIMARY KEY, version INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS publications(market TEXT NOT NULL, version INTEGER NOT NULL, candidate_id TEXT NOT NULL UNIQUE REFERENCES candidates(id), source_revision INTEGER NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(market,version));
+CREATE TABLE IF NOT EXISTS publications(market TEXT NOT NULL, version INTEGER NOT NULL, candidate_id TEXT NOT NULL UNIQUE REFERENCES candidates(id), source_revision INTEGER NOT NULL, digest TEXT, created_at TEXT NOT NULL, PRIMARY KEY(market,version));
 CREATE TABLE IF NOT EXISTS publication_rows(market TEXT NOT NULL, version INTEGER NOT NULL, day TEXT NOT NULL, product TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(market,version,day,product));
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, action TEXT NOT NULL, subject TEXT NOT NULL, details TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS source_contracts(source TEXT NOT NULL, version INTEGER NOT NULL, effective_at TEXT NOT NULL, required_json TEXT NOT NULL, aliases_json TEXT NOT NULL, status TEXT NOT NULL, PRIMARY KEY(source,version));
@@ -46,6 +49,12 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def release_digest(release: dict) -> str:
+    """发布版本的稳定摘要：只覆盖版本元数据和指标行，用于复验已发布版本。"""
+    payload = {"market": release["market"], "version": release["version"], "source_revision": release["source_revision"], "rows": release["rows"]}
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
 class Store:
     def __init__(self, path: str | Path):
         self.path = str(path)
@@ -54,8 +63,24 @@ class Store:
         db = self.connect()
         try:
             db.executescript(SCHEMA)
+            self._migrate(db)
         finally:
             db.close()
+
+    @staticmethod
+    def _migrate(db: sqlite3.Connection) -> None:
+        """兼容已有数据库：只补列和基线历史，不改写已发布的版本行。"""
+        columns = {row["name"] for row in db.execute("PRAGMA table_info(publications)")}
+        if "digest" not in columns:
+            # 旧版本发布时没有摘要，保持 NULL；读取时用 computed_digest 现场复算。
+            db.execute("ALTER TABLE publications ADD COLUMN digest TEXT")
+        # 已有设备的生命周期历史从当前状态开始记录，之后每次修订都可回溯。
+        db.execute(
+            "INSERT INTO device_revisions(device_id,revision,action,installed_at,retired_at,previous_installed_at,previous_retired_at,note,source_revision,at) "
+            "SELECT d.id,d.revision,'baseline',d.installed_at,d.retired_at,NULL,NULL,'',0,? FROM devices d "
+            "WHERE NOT EXISTS (SELECT 1 FROM device_revisions r WHERE r.device_id=d.id)",
+            (now(),),
+        )
 
     def connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=15, isolation_level=None)

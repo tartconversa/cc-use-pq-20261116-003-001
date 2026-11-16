@@ -64,6 +64,7 @@ class Catalog:
             require(not db.execute("SELECT 1 FROM devices WHERE id=?", (device_id,)).fetchone(), "device_exists", "device already exists", 409)
             db.execute("INSERT INTO devices(id,market,product,installed_at) VALUES(?,?,?,?)", (device_id, market, product, installed))
             rev = self.store.bump(db)
+            db.execute("INSERT INTO device_revisions VALUES(?,?,?,?,?,?,?,?,?,?)", (device_id, 1, "installed", installed, None, None, None, "", rev, self.store_now()))
             self.store.audit(db, "device_installed", device_id, {"market": market, "product": product, "source_revision": rev})
         return {"id": device_id, "market": market, "product": product, "installed_at": installed, "revision": 1}
 
@@ -77,6 +78,7 @@ class Catalog:
             require(instant(retired) > instant(row["installed_at"]), "invalid_lifecycle", "retirement must follow installation")
             db.execute("UPDATE devices SET retired_at=?,revision=revision+1 WHERE id=?", (retired, device_id))
             rev = self.store.bump(db)
+            db.execute("INSERT INTO device_revisions VALUES(?,?,?,?,?,?,?,?,?,?)", (device_id, expected_revision + 1, "retired", row["installed_at"], retired, row["installed_at"], None, "", rev, self.store_now()))
             self.store.audit(db, "device_retired", device_id, {"at": retired, "source_revision": rev})
         return {"id": device_id, "retired_at": retired, "revision": expected_revision + 1}
 

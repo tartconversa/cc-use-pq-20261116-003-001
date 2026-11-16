@@ -5,7 +5,8 @@ import json
 import uuid
 from .analytics import Analytics, days_between
 from .errors import require
-from .store import Store, now
+from .lifecycle import OPTIONAL_ZERO_FIELDS
+from .store import Store, now, release_digest
 
 
 class Publication:
@@ -64,41 +65,75 @@ class Publication:
             require(candidate["source_revision"] == expected_source_revision == self.store.revision(db), "stale_source", "source revision changed", 409)
             version = expected_head + 1
             market = candidate["market"]
-            db.execute("INSERT INTO publications VALUES(?,?,?,?,?)", (market, version, candidate_id, expected_source_revision, now()))
+            rows = [json.loads(row[0]) for row in db.execute("SELECT payload FROM candidate_rows WHERE candidate_id=? ORDER BY day,product", (candidate_id,))]
+            digest = release_digest({"market": market, "version": version, "source_revision": expected_source_revision, "rows": rows})
+            db.execute("INSERT INTO publications VALUES(?,?,?,?,?,?)", (market, version, candidate_id, expected_source_revision, digest, now()))
             db.execute("INSERT INTO publication_rows(market,version,day,product,payload) SELECT ?,?,day,product,payload FROM candidate_rows WHERE candidate_id=?", (market, version, candidate_id))
             db.execute("INSERT INTO publication_heads(market,version) VALUES(?,?) ON CONFLICT(market) DO UPDATE SET version=excluded.version", (market, version))
             db.execute("UPDATE candidates SET status='published' WHERE id=?", (candidate_id,))
-            self.store.audit(db, "published", market, {"version": version, "candidate": candidate_id, "source_revision": expected_source_revision})
-            return {"market": market, "version": version, "candidate_id": candidate_id, "source_revision": expected_source_revision}
+            self.store.audit(db, "published", market, {"version": version, "candidate": candidate_id, "source_revision": expected_source_revision, "digest": digest})
+            return {"market": market, "version": version, "candidate_id": candidate_id, "source_revision": expected_source_revision, "digest": digest}
 
     def read(self, market: str, version: int) -> dict:
         with self.store.read() as db:
             meta = db.execute("SELECT * FROM publications WHERE market=? AND version=?", (market, version)).fetchone()
             require(meta is not None, "unknown_publication", "publication unknown", 404)
             rows = db.execute("SELECT payload FROM publication_rows WHERE market=? AND version=? ORDER BY day,product", (market, version)).fetchall()
-            return {**dict(meta), "rows": [json.loads(r[0]) for r in rows]}
+            output = {**dict(meta), "rows": [json.loads(r[0]) for r in rows]}
+            output["computed_digest"] = release_digest(output)
+            if output["digest"] is None:
+                # 早期数据库中发布的版本没有摘要；只报告无法复验，不改写历史行。
+                output["digest_verified"] = None
+            else:
+                output["digest_verified"] = output["digest"] == output["computed_digest"]
+            return output
 
     def versions(self, market: str) -> list[dict]:
         with self.store.read() as db:
             require(db.execute("SELECT 1 FROM markets WHERE code=?", (market,)).fetchone(), "unknown_market", "market unknown", 404)
-            return [dict(row) for row in db.execute("SELECT * FROM publications WHERE market=? ORDER BY version", (market,))]
+            output = []
+            for row in db.execute("SELECT * FROM publications WHERE market=? ORDER BY version", (market,)):
+                item = dict(row)
+                item["computed_digest"] = release_digest(self.read(market, row["version"]))
+                item["digest_verified"] = None if item["digest"] is None else item["digest"] == item["computed_digest"]
+                output.append(item)
+            return output
 
     def diff(self, market: str, old: int, new: int) -> dict:
         previous = self.read(market, old)
         current = self.read(market, new)
-        left = {(r["day"], r["product"]): r for r in previous["rows"]}
-        right = {(r["day"], r["product"]): r for r in current["rows"]}
+        left = {(r["day"], r["product"]): normalize_metric(r) for r in previous["rows"]}
+        right = {(r["day"], r["product"]): normalize_metric(r) for r in current["rows"]}
         changes = []
         for key in sorted(left.keys() | right.keys()):
-            if left.get(key) != right.get(key):
-                changes.append({"day": key[0], "product": key[1], "before": left.get(key), "after": right.get(key)})
-        return {"market": market, "old": old, "new": new, "changes": changes}
+            before, after = left.get(key), right.get(key)
+            if before == after:
+                continue
+            fields = sorted(field for field in (set(before or {}) | set(after or {})) if (before or {}).get(field) != (after or {}).get(field))
+            changes.append({"day": key[0], "product": key[1], "fields_changed": fields, "before": before, "after": after})
+        return {
+            "market": market,
+            "old": old,
+            "new": new,
+            "old_digest": previous["digest"],
+            "new_digest": current["digest"],
+            "old_digest_verified": previous["digest_verified"],
+            "new_digest_verified": current["digest_verified"],
+            "changes": changes,
+            # 只有两端都有可核对的摘要且一致时才算可复验；旧库迁移前的版本会显示 false。
+            "verifiable": previous["digest_verified"] is True and current["digest_verified"] is True,
+        }
 
     def export_csv(self, market: str, version: int) -> str:
         release = self.read(market, version)
         buffer = io.StringIO()
-        fields = ["day", "market", "product", "installed_devices", "active_devices", "exposure_hours", "ticket_opened", "ticket_closed", "ticket_open_at_end", "critical_opened", "acknowledged", "response_hours_total", "telemetry_events", "devices_reporting", "run_hours", "downtime_hours", "telemetry_coverage", "tickets_per_100_devices", "downtime_share"]
-        writer = csv.DictWriter(buffer, fieldnames=fields)
+        fields = ["day", "market", "product", "installed_devices", "active_devices", "exposure_hours", "ticket_opened", "ticket_closed", "ticket_open_at_end", "critical_opened", "acknowledged", "response_hours_total", "telemetry_events", "devices_reporting", "run_hours", "downtime_hours", "excluded_tickets", "excluded_telemetry", "excluded_ticket_actions", "telemetry_coverage", "tickets_per_100_devices", "downtime_share"]
+        writer = csv.DictWriter(buffer, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(release["rows"])
         return buffer.getvalue()
+
+
+def normalize_metric(row: dict) -> dict:
+    """发布版本可能早于某些字段；比较差异时为缺失字段补零。"""
+    return {**{field: 0 for field in OPTIONAL_ZERO_FIELDS}, **row}
